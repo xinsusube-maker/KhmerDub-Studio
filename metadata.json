@@ -1,0 +1,6 @@
+{
+  "name": "Khmer TTS Dubber",
+  "description": "Upload a video and SRT file to synthesize and play Khmer audio voiceovers synchronized with the video.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
