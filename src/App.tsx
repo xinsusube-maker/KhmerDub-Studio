@@ -13,7 +13,7 @@ const TTS_VOICES = [
   { id: 'Aoede', label: 'Female: Aoede' }
 ];
 
-const OPENAI_VOICES = [
+const VOXCPM_VOICES = [
   { id: 'alloy', label: 'Neutral: Alloy' },
   { id: 'echo', label: 'Male: Echo' },
   { id: 'fable', label: 'British Male: Fable' },
@@ -30,6 +30,7 @@ interface Subtitle {
   audioUrl?: string; // object URL to the generated WAV
   isGenerating?: boolean;
   voice: string;
+  engine?: string;
 }
 
 // Convert "00:00:01,000" to seconds
@@ -56,7 +57,7 @@ function parseSRT(srt: string): Subtitle[] {
         const endTime = parseTime(timeMatch[2]);
         const text = lines.slice(2).join(' ').trim();
         if (text) {
-          subtitles.push({ id, startTime, endTime, text, voice: 'alloy' });
+          subtitles.push({ id, startTime, endTime, text, voice: 'default' });
         }
       }
     }
@@ -113,7 +114,7 @@ export default function App() {
   const [previewingId, setPreviewingId] = useState<number | null>(null);
 
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [ttsEngine, setTtsEngine] = useState<'gemini' | 'google-free' | 'openai' | 'voxcpm' | 'azure' | 'gcloud'>('google-free');
+  const [ttsEngine, setTtsEngine] = useState<'gemini' | 'google-free' | 'voxcpm'>('google-free');
 
   const [referenceAudioFile, setReferenceAudioFile] = useState<File | null>(null);
   const [referenceAudioBase64, setReferenceAudioBase64] = useState<string | null>(null);
@@ -158,152 +159,126 @@ export default function App() {
   };
 
   const [showSettings, setShowSettings] = useState(false);
-  const [openAiKey, setOpenAiKey] = useState(() => localStorage.getItem('openai_api_key') || '');
   const [geminiKey, setGeminiKey] = useState(() => localStorage.getItem('gemini_api_key') || '');
-  const [voxcpmUrl, setVoxcpmUrl] = useState(() => localStorage.getItem('voxcpm_url') || 'http://localhost:8808/v1/audio/speech');
-  const [azureKey, setAzureKey] = useState(() => localStorage.getItem('azure_tts_key') || '');
-  const [azureRegion, setAzureRegion] = useState(() => localStorage.getItem('azure_tts_region') || 'southeastasia');
-  const [gcloudKey, setGcloudKey] = useState(() => localStorage.getItem('gcloud_tts_key') || '');
+  const [voxcpmUrl, setVoxcpmUrl] = useState(() => localStorage.getItem('voxcpm_url') || 'http://127.0.0.1:8808');
+
+  const [defaultGeminiVoice, setDefaultGeminiVoice] = useState(() => localStorage.getItem('default_gemini_voice') || 'Puck');
+  const [defaultVoxCPMVoice, setDefaultVoxCPMVoice] = useState(() => localStorage.getItem('default_voxcpm_voice') || 'alloy');
 
   const saveSettings = () => {
-    localStorage.setItem('openai_api_key', openAiKey);
     localStorage.setItem('gemini_api_key', geminiKey);
     localStorage.setItem('voxcpm_url', voxcpmUrl);
-    localStorage.setItem('azure_tts_key', azureKey);
-    localStorage.setItem('azure_tts_region', azureRegion);
-    localStorage.setItem('gcloud_tts_key', gcloudKey);
+    localStorage.setItem('default_gemini_voice', defaultGeminiVoice);
+    localStorage.setItem('default_voxcpm_voice', defaultVoxCPMVoice);
     setShowSettings(false);
   };
 
   // Generate audio for a single subtitle
   const generateSubtitleAudio = async (sub: Subtitle): Promise<string | null> => {
     try {
-      if (ttsEngine === 'voxcpm') {
-        const fullURL = localStorage.getItem('voxcpm_url') || 'http://localhost:8808/v1/audio/speech';
-        let res;
+      const engineToUse = (!sub.engine || sub.engine === 'default') ? ttsEngine : sub.engine;
+      let voiceToUse = sub.voice;
+      if (!voiceToUse || voiceToUse === 'default') {
+        if (engineToUse === 'gemini') voiceToUse = defaultGeminiVoice;
+        else if (engineToUse === 'voxcpm') voiceToUse = defaultVoxCPMVoice;
+        else voiceToUse = 'km'; // fallback
+      }
+
+      if (engineToUse === 'voxcpm') {
+        const baseURL = (localStorage.getItem('voxcpm_url') || 'http://127.0.0.1:8808')
+          .replace(/\/$/, '');
+
+        let refWavPayload = null;
+        if (referenceAudioBase64 && referenceAudioFile) {
+          const mimeType = referenceAudioFile.type || 'audio/wav';
+          const dataUri = `data:${mimeType};base64,${referenceAudioBase64}`;
+          refWavPayload = {
+            name: referenceAudioFile.name,
+            data: dataUri,
+            path: dataUri,
+            meta: { _type: "gradio.FileData" }
+          };
+        }
+
+        const promptText = voiceToUse && voiceToUse !== 'default' ? voiceToUse : '';
+
+        const payload = {
+          data: [
+            sub.text,          // text
+            "",                // control_instruction
+            refWavPayload,     // reference_wav
+            !!promptText,      // use_prompt_text
+            promptText,        // prompt_text
+            2.0,               // cfg_value
+            false,             // normalize
+            false,             // denoise
+            10                 // dit_steps
+          ]
+        };
+
+        let startRes;
         try {
-          res = await fetch(fullURL, {
+          startRes = await fetch(`${baseURL}/gradio_api/call/generate`, {
             method: 'POST',
-            headers: { 
-              'Content-Type': 'application/json',
-              'Authorization': 'Bearer sk-dummy'
-            },
-            body: JSON.stringify({ 
-               input: sub.text, 
-               voice: sub.voice || 'alloy', 
-               model: 'tts-1', // Defaulting to tts-1 as many compatible APIs expect this, or pass what they configure
-               ...(referenceAudioBase64 && {
-                 reference_audio: referenceAudioBase64,
-                 prompt_audio: referenceAudioBase64
-               })
-            })
+            headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+            body: JSON.stringify(payload)
           });
-        } catch (networkErr: any) {
-          throw new Error(`Connection Error: Make sure your VoxCPM server is running at ${fullURL} and CORS is enabled. If using HTTP, check browser Mixed Content settings.`);
-        }
-        
-        if (!res.ok) {
-          let errText = '';
-          try {
-             errText = await res.text();
-          } catch(e) {}
-          if (res.status === 404) {
-             throw new Error(`VoxCPM Error: 404 Not Found. Your endpoint URL (${fullURL}) might be incorrect. Try removing /audio/speech or checking the FastAPI docs.`);
+        } catch (err: any) {
+          if (err.name === 'TypeError' && err.message.includes('Failed to fetch')) {
+            throw new Error(`Failed to connect to VoxCPM at ${baseURL}. If you are seeing a "Failed to fetch" or "Mixed Content" error, it's because this app is served over HTTPS but your VoxCPM server is HTTP. Please use ngrok (e.g. \`ngrok http 8808\`) to get an HTTPS URL for your local server, or allow insecure content in your browser settings.`);
           }
-          throw new Error(`VoxCPM Error: ${res.status} - ${errText || 'Unknown server error'}`);
+          throw err;
         }
-        const blob = await res.blob();
-        return URL.createObjectURL(blob);
-      }
 
-      if (ttsEngine === 'openai') {
-        const apiKey = localStorage.getItem('openai_api_key') || '';
-        
-        const res = await fetch('/api/tts/openai', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
-             text: sub.text, 
-             voice: ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'].includes(sub.voice) ? sub.voice : 'alloy', 
-             model: 'tts-1', 
-             apiKey
-          })
+        if (!startRes.ok) {
+          throw new Error(`VoxCPM start error: ${startRes.status} - ${await startRes.text()}`);
+        }
+
+        const startData = await startRes.json();
+        const eventId = startData.event_id;
+
+        const resultRes = await fetch(
+          `${baseURL}/gradio_api/call/generate/${eventId}`,
+          {
+            headers: {
+              'ngrok-skip-browser-warning': 'true'
+            }
+          }
+        );
+
+        if (!resultRes.ok) {
+          throw new Error(`VoxCPM result error: ${resultRes.status} - ${await resultRes.text()}`);
+        }
+
+        const resultText = await resultRes.text();
+
+        const match = resultText.match(/data:\s*(\[.*\])/s);
+        if (!match) {
+          throw new Error(`VoxCPM returned no audio: ${resultText}`);
+        }
+
+        const parsed = JSON.parse(match[1]);
+        const audioPath = parsed?.[0]?.url || parsed?.[0]?.path;
+
+        if (!audioPath) {
+          throw new Error(`VoxCPM audio URL not found: ${resultText}`);
+        }
+
+        const audioUrl = audioPath.startsWith('http')
+          ? audioPath
+          : `${baseURL}${audioPath}`;
+
+        const audioRes = await fetch(audioUrl, {
+          headers: {
+            'ngrok-skip-browser-warning': 'true'
+          }
         });
-        if (!res.ok) {
-          const errData = await res.json();
-          throw new Error(errData.error || `Failed to fetch ${ttsEngine.toUpperCase()} TTS`);
-        }
-        const data = await res.json();
-        if (!data.result) throw new Error('No audio returned');
+        const blob = await audioRes.blob();
 
-        const binary = atob(data.result);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) {
-          bytes[i] = binary.charCodeAt(i);
-        }
-        const blob = new Blob([bytes], { type: 'audio/mp3' });
         return URL.createObjectURL(blob);
       }
 
-      if (ttsEngine === 'azure') {
-        const apiKey = localStorage.getItem('azure_tts_key') || '';
-        const region = localStorage.getItem('azure_tts_region') || 'southeastasia';
-        
-        const res = await fetch('/api/tts/azure', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
-             text: sub.text, 
-             voice: sub.voice || 'km-KH-PisethNeural',
-             apiKey,
-             region
-          })
-        });
-        if (!res.ok) {
-          const errData = await res.json().catch(() => ({}));
-          throw new Error(errData.error || `Failed to fetch Azure TTS`);
-        }
-        const data = await res.json();
-        if (!data.result) throw new Error('No audio returned');
-
-        const binary = atob(data.result);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) {
-          bytes[i] = binary.charCodeAt(i);
-        }
-        const blob = new Blob([bytes], { type: 'audio/mp3' });
-        return URL.createObjectURL(blob);
-      }
-
-      if (ttsEngine === 'gcloud') {
-        const apiKey = localStorage.getItem('gcloud_tts_key') || '';
-        
-        const res = await fetch('/api/tts/gcloud', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
-             text: sub.text, 
-             voice: sub.voice || 'km-KH-Standard-A',
-             apiKey
-          })
-        });
-        if (!res.ok) {
-          const errData = await res.json().catch(() => ({}));
-          throw new Error(errData.error || `Failed to fetch Google Cloud TTS`);
-        }
-        const data = await res.json();
-        if (!data.result) throw new Error('No audio returned');
-
-        const binary = atob(data.result);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) {
-          bytes[i] = binary.charCodeAt(i);
-        }
-        const blob = new Blob([bytes], { type: 'audio/mp3' });
-        return URL.createObjectURL(blob);
-      }
-
-      if (ttsEngine === 'google-free') {
+      if (engineToUse === 'google-free') {
         const res = await fetch('/api/tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -344,7 +319,7 @@ export default function App() {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
             voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: sub.voice || 'Kore' }, // 'Kore' tends to have good expressiveness
+              prebuiltVoiceConfig: { voiceName: voiceToUse },
             },
           },
         },
@@ -378,6 +353,10 @@ export default function App() {
 
   const handleVoiceChange = (id: number, voice: string) => {
     setSubtitles((prev) => prev.map((s) => (s.id === id ? { ...s, voice, audioUrl: undefined } : s)));
+  };
+
+  const handleEngineChange = (id: number, engine: string) => {
+    setSubtitles((prev) => prev.map((s) => (s.id === id ? { ...s, engine, voice: 'default', audioUrl: undefined } : s)));
   };
 
   const handlePreviewAudio = (e: React.MouseEvent, sub: Subtitle) => {
@@ -647,6 +626,10 @@ export default function App() {
 
   return (
     <div className="w-full h-screen bg-[#020617] text-slate-200 font-sans overflow-hidden flex flex-col">
+      <datalist id="voxcpm-voices">
+        {VOXCPM_VOICES.map(v => <option key={v.id} value={v.id}>{v.label}</option>)}
+      </datalist>
+
       {/* Top Header */}
       <header className="h-14 shrink-0 border-b border-slate-800 flex items-center justify-between px-6 bg-slate-900/50 backdrop-blur-md">
         <div className="flex items-center gap-3">
@@ -798,21 +781,9 @@ export default function App() {
                   className={`flex-1 min-w-[70px] text-[10px] py-1.5 rounded transition bg-transparent ${ttsEngine === 'google-free' ? 'bg-slate-700 text-white' : 'text-slate-400 hover:text-white'}`}
                  >Google Free</button>
                  <button 
-                  onClick={() => setTtsEngine('gcloud')}
-                  className={`flex-1 min-w-[70px] text-[10px] py-1.5 rounded transition ${ttsEngine === 'gcloud' ? 'bg-blue-600 text-white font-medium' : 'text-slate-400 hover:text-white'}`}
-                 >GCloud</button>
-                 <button 
-                  onClick={() => setTtsEngine('azure')}
-                  className={`flex-1 min-w-[70px] text-[10px] py-1.5 rounded transition ${ttsEngine === 'azure' ? 'bg-cyan-600 text-white font-medium' : 'text-slate-400 hover:text-white'}`}
-                 >Azure</button>
-                 <button 
                   onClick={() => setTtsEngine('voxcpm')}
                   className={`flex-1 min-w-[70px] text-[10px] py-1.5 rounded transition ${ttsEngine === 'voxcpm' ? 'bg-purple-600 text-white font-medium' : 'text-slate-400 hover:text-white'}`}
                  >VoxCPM</button>
-                 <button 
-                  onClick={() => setTtsEngine('openai')}
-                  className={`flex-1 min-w-[70px] text-[10px] py-1.5 rounded transition ${ttsEngine === 'openai' ? 'bg-[#10a37f] text-white font-medium' : 'text-slate-400 hover:text-white'}`}
-                 >OpenAI</button>
                  <button 
                   onClick={() => setTtsEngine('gemini')}
                   className={`flex-1 min-w-[70px] text-[10px] py-1.5 rounded transition ${ttsEngine === 'gemini' ? 'bg-amber-600 text-white font-medium' : 'text-slate-400 hover:text-white'}`}
@@ -821,17 +792,8 @@ export default function App() {
                {ttsEngine === 'google-free' && (
                  <p className="text-[10px] text-slate-500">Free, basic text-to-speech. Unlimited attempts.</p>
                )}
-               {ttsEngine === 'gcloud' && (
-                 <p className="text-[10px] text-blue-400/80">Requires Google Cloud API Key. Standard and Wavenet voices.</p>
-               )}
-               {ttsEngine === 'azure' && (
-                 <p className="text-[10px] text-cyan-400/80">Requires Azure API Key & Region. High-quality Neural voices.</p>
-               )}
                {ttsEngine === 'voxcpm' && (
-                 <p className="text-[10px] text-purple-400/80">Uses local VoxCPM OpenAI-compatible endpoint.</p>
-               )}
-               {ttsEngine === 'openai' && (
-                 <p className="text-[10px] text-emerald-500/70">Requires OPENAI_API_KEY. Extremely fluent.</p>
+                 <p className="text-[10px] text-purple-400/80">Uses local VoxCPM Gradio endpoint for generation.</p>
                )}
                {ttsEngine === 'gemini' && (
                  <p className="text-[10px] text-amber-500/70">High-quality dramatic voice. Limited by quota (15 RPM free).</p>
@@ -910,63 +872,46 @@ export default function App() {
                       <p className={`text-sm leading-relaxed mb-2 ${isActive ? 'text-slate-200 font-medium' : 'text-slate-400'}`}>
                         {sub.text}
                       </p>
-                      <div className="flex items-center justify-end">
-                        {ttsEngine === 'gemini' ? (
+                      <div className="flex items-center justify-end gap-2">
+                        <select
+                          value={sub.engine || 'default'}
+                          onClick={(e) => e.stopPropagation()}
+                          onChange={(e) => handleEngineChange(sub.id, e.target.value)}
+                          className="bg-slate-900 text-[10px] text-slate-400 border border-slate-700 rounded px-2 py-1 outline-none hover:border-slate-500/50 transition-colors"
+                        >
+                          <option value="default">Global Engine</option>
+                          <option value="gemini">Gemini</option>
+                          <option value="voxcpm">VoxCPM</option>
+                          <option value="google-free">Google Free</option>
+                        </select>
+                        {(() => {
+                          const eng = (!sub.engine || sub.engine === 'default') ? ttsEngine : sub.engine;
+                          return eng === 'gemini' ? (
                           <select 
                             value={sub.voice} 
                             onClick={(e) => e.stopPropagation()}
                             onChange={(e) => handleVoiceChange(sub.id, e.target.value)}
                             className="bg-slate-900 text-[10px] text-slate-400 border border-slate-700 rounded px-2 py-1 outline-none hover:border-amber-500/50 transition-colors"
                           >
+                            <option value="default">Global Default</option>
                             {TTS_VOICES.map((v) => (
                               <option key={v.id} value={v.id}>{v.label}</option>
                             ))}
                           </select>
-                        ) : ttsEngine === 'openai' ? (
-                          <select 
-                            value={sub.voice} 
-                            onClick={(e) => e.stopPropagation()}
-                            onChange={(e) => handleVoiceChange(sub.id, e.target.value)}
-                            className="bg-slate-900 text-[10px] text-emerald-500/80 border border-slate-700 rounded px-2 py-1 outline-none hover:border-emerald-500/50 transition-colors"
-                          >
-                            {OPENAI_VOICES.map((v) => (
-                              <option key={v.id} value={v.id}>{v.label}</option>
-                            ))}
-                          </select>
-                        ) : ttsEngine === 'gcloud' ? (
-                          <select 
-                            value={sub.voice} 
-                            onClick={(e) => e.stopPropagation()}
-                            onChange={(e) => handleVoiceChange(sub.id, e.target.value)}
-                            className="bg-slate-900 text-[10px] text-blue-400 border border-slate-700 rounded px-2 py-1 outline-none hover:border-blue-500/50 transition-colors"
-                          >
-                            {['km-KH-Standard-A', 'km-KH-Standard-B', 'km-KH-Standard-C', 'km-KH-Standard-D', 'km-KH-Wavenet-A', 'km-KH-Wavenet-B', 'km-KH-Wavenet-C', 'km-KH-Wavenet-D'].map((v) => (
-                              <option key={v} value={v}>{v}</option>
-                            ))}
-                          </select>
-                        ) : ttsEngine === 'azure' ? (
-                          <select 
-                            value={sub.voice} 
-                            onClick={(e) => e.stopPropagation()}
-                            onChange={(e) => handleVoiceChange(sub.id, e.target.value)}
-                            className="bg-slate-900 text-[10px] text-cyan-400 border border-slate-700 rounded px-2 py-1 outline-none hover:border-cyan-500/50 transition-colors"
-                          >
-                            {['km-KH-PisethNeural', 'km-KH-SreymomNeural'].map((v) => (
-                              <option key={v} value={v}>{v}</option>
-                            ))}
-                          </select>
-                        ) : ttsEngine === 'voxcpm' ? (
+                        ) : eng === 'voxcpm' ? (
                           <input 
                             type="text"
-                            value={sub.voice}
+                            list="voxcpm-voices"
+                            value={sub.voice === 'default' ? '' : sub.voice}
                             onClick={(e) => e.stopPropagation()}
-                            onChange={(e) => handleVoiceChange(sub.id, e.target.value)}
-                            placeholder="Voice ID"
-                            className="w-24 bg-slate-900 text-[10px] text-purple-400/80 border border-slate-700 rounded px-2 py-1 outline-none hover:border-purple-500/50 transition-colors"
+                            onChange={(e) => handleVoiceChange(sub.id, e.target.value || 'default')}
+                            placeholder={`Prompt Text (Default: ${defaultVoxCPMVoice})`}
+                            className="w-32 bg-slate-900 text-[10px] text-purple-400/80 border border-slate-700 rounded px-2 py-1 outline-none hover:border-purple-500/50 transition-colors"
                           />
                         ) : (
                           <span className="text-[10px] text-slate-600 italic">Default Voice</span>
-                        )}
+                        );
+                        })()}
                       </div>
                     </div>
                   );
@@ -988,77 +933,57 @@ export default function App() {
           <div className="bg-slate-900 border border-slate-700 rounded-xl w-full max-w-md p-6 shadow-2xl">
             <h2 className="text-xl font-semibold text-white mb-6">API Configuration</h2>
             
-            <div className="space-y-4 mb-6">
+            <div className="space-y-4 mb-6 max-h-[65vh] overflow-y-auto pr-2 custom-scrollbar">
               <div>
-                <label className="block text-sm font-medium text-slate-300 mb-1.5">OpenAI API Key</label>
-                <input
-                  type="password"
-                  value={openAiKey}
-                  onChange={(e) => setOpenAiKey(e.target.value)}
-                  placeholder="sk-..."
-                  className="w-full bg-slate-950 border border-slate-800 rounded-md px-3 py-2 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition-all"
-                />
-                <p className="text-[10px] text-slate-500 mt-1">Reqiured for OpenAI TTS models.</p>
-              </div>
-              
-              <div>
-                <label className="block text-sm font-medium text-slate-300 mb-1.5">Azure Speech Key & Region</label>
+                <label className="block text-sm font-medium text-slate-300 mb-1.5 flex justify-between">
+                  <span>VoxCPM Server URL & Voice</span>
+                  <a href="https://support.google.com/chrome/answer/99020" target="_blank" rel="noreferrer" className="text-[10px] text-purple-400 hover:text-purple-300 underline">Mixed Content Fix</a>
+                </label>
                 <div className="flex gap-2">
                   <input
-                    type="password"
-                    value={azureKey}
-                    onChange={(e) => setAzureKey(e.target.value)}
-                    placeholder="Azure Key"
-                    className="flex-1 bg-slate-950 border border-slate-800 rounded-md px-3 py-2 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 transition-all"
+                    type="text"
+                    value={voxcpmUrl}
+                    onChange={(e) => setVoxcpmUrl(e.target.value)}
+                    placeholder="https://your-ngrok/v1/audio/speech"
+                    className="flex-1 bg-slate-950 border border-slate-800 rounded-md px-3 py-2 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-purple-500 focus:ring-1 focus:ring-purple-500 transition-all font-mono"
                   />
                   <input
                     type="text"
-                    value={azureRegion}
-                    onChange={(e) => setAzureRegion(e.target.value)}
-                    placeholder="Region (e.g. eastus)"
-                    className="w-32 bg-slate-950 border border-slate-800 rounded-md px-3 py-2 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 transition-all"
+                    list="voxcpm-voices"
+                    value={defaultVoxCPMVoice}
+                    onChange={(e) => setDefaultVoxCPMVoice(e.target.value)}
+                    placeholder="Prompt Text"
+                    className="w-24 bg-slate-950 border border-slate-800 rounded-md px-3 py-2 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-purple-500 transition-all"
                   />
+                </div>
+                <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">
+                  Full VoxCPM Gradio endpoint URL. Needs to be accessible from this app.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-300 mb-1.5 flex justify-between">
+                  <span>Gemini API Key & Default Voice</span>
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    value={geminiKey}
+                    onChange={(e) => setGeminiKey(e.target.value)}
+                    placeholder="AIza..."
+                    className="flex-1 bg-slate-950 border border-slate-800 rounded-md px-3 py-2 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 transition-all"
+                  />
+                  <select 
+                    value={defaultGeminiVoice} 
+                    onChange={(e) => setDefaultGeminiVoice(e.target.value)}
+                    className="w-32 bg-slate-950 border border-slate-800 rounded-md px-2 py-2 text-sm text-white focus:outline-none focus:border-amber-500 transition-all"
+                  >
+                    {TTS_VOICES.map((v) => <option key={v.id} value={v.id}>{v.id}</option>)}
+                  </select>
                 </div>
               </div>
 
-              <div>
-                <label className="block text-sm font-medium text-slate-300 mb-1.5">Google Cloud API Key (TTS)</label>
-                <input
-                  type="password"
-                  value={gcloudKey}
-                  onChange={(e) => setGcloudKey(e.target.value)}
-                  placeholder="AIza..."
-                  className="w-full bg-slate-950 border border-slate-800 rounded-md px-3 py-2 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all"
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-slate-300 mb-1.5">Gemini API Key</label>
-                <input
-                  type="password"
-                  value={geminiKey}
-                  onChange={(e) => setGeminiKey(e.target.value)}
-                  placeholder="AIza..."
-                  className="w-full bg-slate-950 border border-slate-800 rounded-md px-3 py-2 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 transition-all"
-                />
-                <p className="text-[10px] text-slate-500 mt-1">Optional. Overrides the default workspace key if provided.</p>
-              </div>
-
               <div className="pt-2 border-t border-slate-800">
-                <label className="block text-sm font-medium text-slate-300 mb-1.5 flex justify-between">
-                  <span>VoxCPM Server URL (Full Endpoint)</span>
-                  <a href="https://support.google.com/chrome/answer/99020" target="_blank" rel="noreferrer" className="text-[10px] text-purple-400 hover:text-purple-300 underline">Mixed Content Fix</a>
-                </label>
-                <input
-                  type="text"
-                  value={voxcpmUrl}
-                  onChange={(e) => setVoxcpmUrl(e.target.value)}
-                  placeholder="https://your-ngrok-url/v1/audio/speech"
-                  className="w-full bg-slate-950 border border-slate-800 rounded-md px-3 py-2 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-purple-500 focus:ring-1 focus:ring-purple-500 transition-all font-mono"
-                />
-                <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">
-                  The FULL exact URL to the TTS endpoint (e.g., <code>https://...ngrok-free.app/v1/audio/speech</code>). If you get a <b>404 FastApi Not Found</b> error, check your server documentation for the correct endpoint path (it might be <code>/tts</code> or <code>/v1/tts</code> instead).
-                </p>
               </div>
             </div>
 
